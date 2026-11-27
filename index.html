@@ -2975,6 +2975,7 @@ function migrate(c) {
 // 삭제 기록은 공용 캐시에 함께 저장해 다른 탭의 오래된 캐릭터가 복구되지 않도록 한다.
 const LOCAL_DELETIONS = {};
 function markLocalDeletion(id) { if (id) LOCAL_DELETIONS[id] = Date.now(); }
+var VELVET_DELETING = typeof VELVET_DELETING !== 'undefined' ? VELVET_DELETING : new Set();
 /* 내 캐릭터 = owner가 내 아이디인 것. 아이디 없던 시절(구버전) 캐릭터는 로그인 시 내 것으로 편입 */
 function sortOwnership() {
   const me = ME(); S.store ||= {};
@@ -4032,7 +4033,7 @@ const FB = {status: 'off', msg: '', log: [], ref: null, uref: null, db: null, pe
     if (this.ref && c.room && c.room === S.settings.room) this.ref.child('chars/' + c.id).set(data).catch(err);
     if (c.prevRoom && c.prevRoom !== c.room) { this.db.ref(`velvet/rooms/${fbKey(c.prevRoom)}/chars/${c.id}`).remove(); delete c.prevRoom; }
   },
-  remove(c) { if (!this.db || !c || c.owner !== ME()) return; this.db.ref(`velvet/users/${fbKey(ME())}/chars/${c.id}`).remove(); if (c.room) this.db.ref(`velvet/rooms/${fbKey(c.room)}/chars/${c.id}`).remove(); },
+  async remove(c) { if (!c || c.owner !== ME()) throw Error('본인 캐릭터만 삭제할 수 있어'); if (!this.db && this.cfg()) await this.init(); if (!this.db) throw Error('Firebase 연결이 없어. 서버에서 삭제하려면 온라인 연결이 필요해'); const id = fbKey(c.id), user = fbKey(ME()); if (typeof SYNC !== 'undefined') { clearTimeout(SYNC['t' + c.id]); if (SYNC.pushFlights?.[c.id]) await SYNC.pushFlights[c.id].catch(() => { }) } const update = {}; update[`velvet/users/${user}/chars/${id}`] = null; update[`velvet/users/${user}/deleted/${id}`] = { at: Date.now() }; for (const room of new Set([c.room, c.prevRoom].filter(Boolean))) { update[`velvet/rooms/${fbKey(room)}/chars/${id}`] = null; update[`velvet/rooms/${fbKey(room)}/play/tok/c_${id}`] = null } await this.db.ref().update(update); if (typeof SYNC !== 'undefined') { delete SYNC.serverPacked?.[c.id]; delete SYNC.base?.[c.id]; delete SYNC.lastZ?.['u' + c.id]; delete SYNC.lastZ?.['r' + c.id]; if (SYNC.seq) SYNC.seq[c.id] = (SYNC.seq[c.id] || 0) + 1 } },
   logPush(txt) { const e = {who: ME() || C()?.info.name || '?', txt, t: Date.now()}; if (this.ref) this.ref.child('log').push(e); else { this.log.push(e); this.log = this.log.slice(-60); } }
 };
 function parseCfg(txt) {
@@ -4061,6 +4062,7 @@ const A = {
   // so FB.remove() skipped them and they could not be removed anywhere else.
   pickDel: async e => {
     const id = e.dataset.v, c = S.chars[id]; if (!c) return;
+    if (c.owner && c.owner === ME()) return A.delChar(e);
     const name = c.info?.name || '이름 없음';
     if (!confirm(`"${name}" 캐릭터를 삭제할까요?\n이 기기와 서버에서 모두 지워지고 되돌릴 수 없어요.`)) return;
     const rooms = [...new Set([c.room, c.prevRoom].filter(Boolean))];
@@ -4072,11 +4074,14 @@ const A = {
         for (const room of rooms) { const ref = FB.db.ref(`velvet/rooms/${fbKey(room)}/chars/${id}`), v = (await ref.once('value')).val(); if (v && (!v.owner || v.owner === ME())) await ref.remove(); }
       } catch (err) { return toast('이 기기에서는 지웠지만 서버 삭제에 실패했어요: ' + err.message, 1); }
     }
+    if (typeof VAULT !== 'undefined' && VAULT.ready) await VAULT.deletedNow();
     toast(`"${name}" 캐릭터를 삭제했어요`);
   },  toPicker: () => { S.picker = true; render(); scrollTo(0, 0); },
   logout: () => { if (GATE.el) { GATE.mode = ''; } FB.logoutRefs(); S.settings.userId = ''; S.picker = true; sortOwnership(); saveLocal(); closeModal(); render(); },
   dupChar: () => { if (!confirm(`“${C().info.name || '이 캐릭터'}”의 복사본을 내 캐릭터로 하나 더 만들까요?\n(원본은 그대로 남습니다)`)) return; const c = deep(C()); c.id = uid(); c.owner = ME(); c.ownerName = ME(); c.info.name = (c.info.name || '') + ' (사본)'; c.room = ''; S.chars[c.id] = c; S.cur = c.id; touch(); render(); },
-  delChar: () => { if (isRO()) return toast('다른 사람의 시트는 삭제할 수 없습니다', 1); if (!confirm(`"${C().info.name || '이름 없음'}" 캐릭터를 삭제할까요?`)) return; markLocalDeletion(S.cur); FB.remove(C()); delete S.chars[S.cur]; S.cur = Object.keys(S.chars)[0] || null; S.picker = true; saveLocal(); render(); },
+  delChar: async (e) => { const id = e?.dataset?.v || S.cur, c = S.chars[id]; if (!c || c.owner !== ME()) return toast('내 캐릭터만 삭제할 수 있어', 1); if (typeof VELVET_DELETING !== 'undefined' && VELVET_DELETING.has(id)) return; if (!confirm(`“${c.info.name || '이름 없음'}” 캐릭터를 영구 삭제할까?
+이 기기와 Firebase의 캐릭터 저장 데이터, 참가 중인 방의 공유본까지 삭제돼.
+(되돌릴 수 없으니 필요하면 먼저 JSON으로 백업해 줘.)`)) return; if (typeof VELVET_DELETING !== 'undefined') VELVET_DELETING.add(id); const online = !!(FB.db || (typeof FB.cfg === 'function' && FB.cfg())); try { if (online) await FB.remove(c); markLocalDeletion(id); if (typeof SYNC !== 'undefined') { clearTimeout(SYNC['t' + id]); delete SYNC.serverPacked?.[id]; delete SYNC.base?.[id]; if (SYNC.seq) SYNC.seq[id] = (SYNC.seq[id] || 0) + 1 } delete S.chars[id]; if (S.store) delete S.store[id]; if (S.remote) delete S.remote[id]; if (S.hist) delete S.hist[id]; if (S.fut) delete S.fut[id]; if (typeof lastSnap !== 'undefined') delete lastSnap[id]; if (S.cur === id) S.cur = Object.keys(S.chars)[0] || null; S.picker = true; saveLocal(); if (typeof VAULT !== 'undefined' && VAULT.ready) await VAULT.deletedNow(); render(); toast(online ? '캐릭터와 Firebase 저장 데이터를 삭제했어' : '기기에 저장된 캐릭터를 삭제했어') } catch (e) { console.error('캐릭터 삭제 실패', e); toast('삭제 실패: ' + e.message, 1) } finally { if (typeof VELVET_DELETING !== 'undefined') VELVET_DELETING.delete(id) } },
   openChar: e => { S.cur = e.dataset.v; if (S.tab === 'party') S.tab = 'profile'; saveLocal(); render(); scrollTo(0, 0); },
   undo: () => undo(), redo: () => redo(),
   export: () => download(`${C().info.name || 'velvet'}_시트.json`, JSON.stringify(C(), null, 1)),
